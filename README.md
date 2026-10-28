@@ -14,5 +14,6 @@ to mimic congestion.
 64-bit client, 64-bit server
 
 
-32-bit client running on 486DX33, 10 Mbps network card, 64-bit server
+32-bit client running on 486DX33, 10 Mbps network card, 64-bit server.
+
 https://github.com/user-attachments/assets/2c98665a-dac3-4d9d-859a-622335e8ded9
