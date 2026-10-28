@@ -21,6 +21,7 @@ while(1)
 	usleep(500);
 }
 
+# we'll never get here, oh well
 defined $sent
     or die "UDP send failed: $!\n";
 
