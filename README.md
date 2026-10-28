@@ -9,6 +9,6 @@ card while the server runs on my modern 64-bit Linux workstation.
 Perl directory has a 'flood.pl' script that bombards the lowly 486 network interface with UDP datagrams
 to mimic congestion.
 
-[Watch the demo video](https://github.com/kodell-64/udp-bbr/demos/demo-i386-client.ogv)
+[Watch the demo video](https://github.com/kodell-64/udp-bbr/blob/main/demos/demo-i386-client.ogv)  
 
 
