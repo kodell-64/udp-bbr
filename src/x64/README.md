@@ -22,14 +22,57 @@ make
 | `client.c` | Receiver: writes chunks, sends range ACKs |
 | `proto.h` | Wire format and helpers |
 | `linkemu.c` | UDP link emulator: bottleneck rate, drop-tail queue, delay, loss |
+| `i386_divdi.c` | 64-bit division helpers for 32-bit builds without libgcc |
+
+## Building the client: 64-bit and 32-bit
+
+`make` builds a normal, dynamically linked 64-bit client. Two more options:
+
+**32-bit client**, if your system has 32-bit libraries
+(Debian/Ubuntu: `apt install gcc-multilib`):
+
+```
+make client32                      # -> udpbbr_client32
+```
+
+**Fully static clients** that run on any x86 Linux, with no library
+dependencies, built against [musl](https://musl.libc.org) libc:
+
+```
+# once, from the musl 1.2.5 source:
+CC="gcc -m32 -march=i486" ./configure --target=i386-linux-musl \
+    --prefix=$HOME/musl32 --disable-shared
+make AR=ar RANLIB=ranlib install && make distclean
+CC=gcc ./configure --prefix=$HOME/musl64 --disable-shared && make install
+
+# then, here:
+make udpbbr_client MUSL64=$HOME/musl64
+make client32      MUSL32=$HOME/musl32 CFLAGS="-std=gnu11 -O2 -Wall -Wextra -march=i486"
+```
+
+The 32-bit static build doesn't need gcc's 32-bit runtime (libgcc):
+`i386_divdi.c` supplies the 64-bit division routines that a 32-bit CPU
+needs. The prebuilt binaries were made this way:
+
+| Binary | Target | Runs on |
+|---|---|---|
+| `udpbbr_client` | x86-64, static (musl) | any x86-64 Linux |
+| `udpbbr_client32` | i386, static (musl), `-march=i486` | 486 or later CPU; also 64-bit kernels with 32-bit support |
+
+Both clients talk to the same server. File offsets are 64-bit throughout,
+so 32-bit builds should handle files over 4 GB; the largest file tested
+here is 100 MB. The kernel minimum comes from `ppoll()` (Linux 2.6.16).
 
 ## Usage
 
 ```
-udpbbr_server [-p port] [-d dir] [-l log.csv] [-q]
+udpbbr_server [-p port] [-d dir] [-l log.csv] [-q] [-D] [-o logfile] [-P pidfile]
     -l  write BBR state every 5 ms as CSV (state, bw, pacing, cwnd,
         inflight, min_rtt, srtt, inflight_hi, losses)
     -q  no per-second status lines
+    -D  run as a daemon in the background
+    -o  with -D: append log messages to this file (default: discard them)
+    -P  write the process ID to this file; removed on exit
 
 udpbbr_client [-p port] host remote_name [local_file]
 
@@ -42,6 +85,44 @@ The server prints one line per second:
 ```
  3.0s ProbeBW_DOWN   bw 19.83 Mb/s pacing 17.67 cwnd 193K inflight 153K inflight_hi 193K min_rtt 40.7ms ...
 ```
+
+### Running as a daemon
+
+```
+./udpbbr_server -D -d /srv/files -o /var/log/udpbbr.log -P /run/udpbbr.pid
+kill $(cat /run/udpbbr.pid)          # stop it
+```
+
+With `-D` the server detaches the classic Unix way: fork, `setsid`, fork
+again, `chdir("/")`, `umask 022`, stdin from `/dev/null`, output to the `-o`
+file. It ignores SIGHUP. SIGTERM or SIGINT ends the current transfer, logs
+how much of it was delivered, removes the PID file and exits with status 0.
+
+Before detaching, it resolves relative paths (`-d`, `-o`, `-P`), checks the
+directory exists, and binds the port. A missing directory or a port already
+in use is therefore reported on the terminal with exit status 1. It also
+refuses to start if the PID file names a process that is still running.
+
+Daemon mode logs one timestamped line per event: startup, each request,
+one summary per transfer, and shutdown.
+
+```
+2026-10-28 16:59:33 serving /srv/files on UDP port 9953 (pid 391)
+2026-10-28 16:59:33 10.0.0.7:51561 requested 'big.iso' (30000000 bytes)
+2026-10-28 16:59:36 STOPPED: 6777600 of 30000000 bytes in 2.98 s = 18.20 Mb/s goodput | ...
+2026-10-28 16:59:36 stopping (signal received)
+```
+
+Under systemd, run it in the foreground instead and let systemd manage it:
+
+```
+[Service]
+ExecStart=/usr/local/bin/udpbbr_server -q -d /srv/files
+Restart=on-failure
+```
+
+If the server stops mid-transfer, the client gives up after 20 s without
+data ("server went silent").
 
 ### Trying it on an emulated link
 

@@ -2,6 +2,10 @@
  * server.c - UDP file server that sends with BBRv3 congestion control.
  *
  *   ./udpbbr_server [-p port] [-d directory] [-l log.csv] [-q]
+ *                   [-D] [-o logfile] [-P pidfile]
+ *
+ *   -D  run as a daemon: detach from the terminal, log to -o (or discard),
+ *       write the PID to -P; SIGTERM or SIGINT stops it cleanly.
  *
  * A client sends REQ <filename>; the server answers META and streams the
  * file in CHUNK_SIZE pieces. Reliability is QUIC-like: monotonically
@@ -17,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -27,6 +32,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "bbr3.h"
@@ -78,6 +84,18 @@ typedef struct {
 
 static int   g_quiet;
 static FILE *g_log;
+static int   g_daemon;
+static const char *g_pidfile;
+static volatile sig_atomic_t g_stop;     /* set by SIGTERM / SIGINT */
+
+/* Timestamp prefix for event lines (useful in a daemon's log file). */
+static void stamp(void)
+{
+    char tb[32];
+    time_t t = time(NULL);
+    strftime(tb, sizeof tb, "%Y-%m-%d %H:%M:%S ", localtime(&t));
+    fputs(tb, stderr);
+}
 
 /* ------------------------------------------------------------------ */
 static void die(const char *m) { perror(m); exit(1); }
@@ -396,7 +414,7 @@ static void serve(int fd, struct sockaddr_in *peer, int file_fd, uint64_t size)
     int64_t next_print = x->start + 1000000, next_log = x->start;
     uint8_t buf[MAX_PKT];
 
-    while (!x->done) {
+    while (!x->done && !g_stop) {
         int64_t now = now_us();
 
         /* 1. read everything waiting */
@@ -434,6 +452,7 @@ static void serve(int fd, struct sockaddr_in *peer, int file_fd, uint64_t size)
         if (x->bbr.inflight > 0 && now >= pto_deadline(x))
             on_pto(x);
         if (now - x->last_ack_time > IDLE_ABORT_US) {
+            stamp();
             fprintf(stderr, "no ACKs for %d s, aborting transfer\n", IDLE_ABORT_US / 1000000);
             x->aborted = 1;
             break;
@@ -500,15 +519,28 @@ static void serve(int fd, struct sockaddr_in *peer, int file_fd, uint64_t size)
 
     int64_t end = now_us();
     double secs = (end - x->start) / 1e6;
-    if (!g_quiet || x->aborted) {
+    if (!g_quiet)
         print_status(x, end);
+    {
+        /* Bytes the client has acknowledged (all of them unless cut short). */
+        int complete = x->acked_chunks == x->n_chunks;
+        uint64_t got = complete ? size : x->acked_chunks * CHUNK_SIZE;
+        if (got > size)
+            got = size;                 /* last chunk is short */
+        char what[64];
+        if (complete)
+            snprintf(what, sizeof what, "%llu bytes", (unsigned long long)size);
+        else
+            snprintf(what, sizeof what, "%llu of %llu bytes",
+                     (unsigned long long)got, (unsigned long long)size);
+        stamp();
         fprintf(stderr,
-                "%s: %llu bytes in %.2f s = %.2f Mb/s goodput | packets %llu, "
+                "%s: %s in %.2f s = %.2f Mb/s goodput | packets %llu, "
                 "retransmitted %llu (%.2f%%), declared lost %llu, spurious %llu | "
                 "min_rtt %.1f ms, srtt %.1f ms\n",
-                x->aborted ? "ABORTED" : "done", (unsigned long long)size, secs,
-                size * 8 / secs / 1e6, (unsigned long long)x->pkts_sent,
-                (unsigned long long)x->retx_sent,
+                x->aborted ? "ABORTED" : !complete && g_stop ? "STOPPED" : "done",
+                what, secs, secs > 0 ? got * 8 / secs / 1e6 : 0.0,
+                (unsigned long long)x->pkts_sent, (unsigned long long)x->retx_sent,
                 x->pkts_sent ? 100.0 * x->retx_sent / x->pkts_sent : 0.0,
                 (unsigned long long)x->lost_pkts, (unsigned long long)x->spurious,
                 x->min_rtt / 1e3, x->srtt / 1e3);
@@ -523,11 +555,114 @@ static int safe_name(const char *n)
     return n[0] && n[0] != '.' && !strchr(n, '/') && !strchr(n, '\\') && !strstr(n, "..");
 }
 
+/* ------------------------------------------------------------------ */
+/* Daemon support                                                        */
+/* ------------------------------------------------------------------ */
+static void on_stop_signal(int sig) { (void)sig; g_stop = 1; }
+
+static void remove_pidfile(void)
+{
+    if (g_pidfile)
+        unlink(g_pidfile);
+}
+
+/* Refuse to start if the PID file names a process that is still running. */
+static void check_pidfile(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    long pid;
+    if (!f)
+        return;
+    if (fscanf(f, "%ld", &pid) == 1 && pid > 0 && kill((pid_t)pid, 0) == 0) {
+        fprintf(stderr, "already running as pid %ld (%s)\n", pid, path);
+        exit(1);
+    }
+    fclose(f);                         /* stale: will be overwritten */
+}
+
+static void write_pidfile(const char *path)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        stamp();
+        fprintf(stderr, "can't write pid file %s: %s\n", path, strerror(errno));
+        return;
+    }
+    fprintf(f, "%ld\n", (long)getpid());
+    fclose(f);
+}
+
+/* Classic double-fork daemonisation. Output goes to `logpath` (appended)
+ * or /dev/null. Paths must already be absolute: we chdir("/"). */
+static void daemonize(const char *logpath)
+{
+    pid_t pid = fork();
+    if (pid < 0) die("fork");
+    if (pid > 0) _exit(0);             /* parent: back to the shell */
+    if (setsid() < 0) die("setsid");   /* new session, no controlling tty */
+    signal(SIGHUP, SIG_IGN);
+    pid = fork();
+    if (pid < 0) die("fork");
+    if (pid > 0) _exit(0);             /* not a session leader: can't regain a tty */
+
+    umask(022);
+    int nul = open("/dev/null", O_RDWR);
+    int out = logpath ? open(logpath, O_WRONLY | O_CREAT | O_APPEND, 0644) : nul;
+    if (nul < 0 || out < 0) die(logpath ? logpath : "/dev/null");
+    if (chdir("/") < 0) die("chdir");
+    dup2(nul, STDIN_FILENO);
+    dup2(out, STDOUT_FILENO);
+    dup2(out, STDERR_FILENO);
+    if (nul > STDERR_FILENO) close(nul);
+    if (out > STDERR_FILENO && out != nul) close(out);
+}
+
+static char *absolute(const char *path)
+{
+    char *r = realpath(path, NULL);
+    if (!r) die(path);
+    return r;
+}
+
+/* An absolute path for a file that may not exist yet (its directory must). */
+static char *absolute_file(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    char dirpart[PATH_MAX];
+    if (path[0] == '/')
+        return strdup(path);
+    if (!slash)
+        snprintf(dirpart, sizeof dirpart, ".");
+    else
+        snprintf(dirpart, sizeof dirpart, "%.*s", (int)(slash - path), path);
+    char *d = absolute(dirpart);
+    size_t n = strlen(d) + strlen(path) + 2;
+    char *r = malloc(n);
+    snprintf(r, n, "%s/%s", d, slash ? slash + 1 : path);
+    free(d);
+    return r;
+}
+
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "usage: %s [-p port] [-d dir] [-l log.csv] [-q] [-D] [-o logfile] [-P pidfile]\n"
+            "  -p port     UDP port (default 9001)\n"
+            "  -d dir      directory to serve (default .)\n"
+            "  -l file     BBR state log, CSV every 5 ms\n"
+            "  -q          no per-second status lines\n"
+            "  -D          run as a daemon in the background\n"
+            "  -o file     with -D: append messages to this file (default: discard)\n"
+            "  -P file     write the process ID here (removed on exit)\n",
+            argv0);
+    exit(1);
+}
+
 int main(int argc, char **argv)
 {
     int port = 9001, opt;
-    const char *dir = ".";
-    while ((opt = getopt(argc, argv, "p:d:l:qh")) != -1) {
+    const char *dir = ".", *logpath = NULL;
+    while ((opt = getopt(argc, argv, "p:d:l:qDo:P:h")) != -1) {
         switch (opt) {
         case 'p': port = atoi(optarg); break;
         case 'd': dir = optarg; break;
@@ -538,14 +673,35 @@ int main(int argc, char **argv)
                            "min_rtt_ms,srtt_ms,inflight_hi,lost_pkts,acked_chunks\n");
             break;
         case 'q': g_quiet = 1; break;
-        default:
-            fprintf(stderr, "usage: %s [-p port] [-d dir] [-l log.csv] [-q]\n", argv[0]);
-            return 1;
+        case 'D': g_daemon = 1; break;
+        case 'o': logpath = optarg; break;
+        case 'P': g_pidfile = optarg; break;
+        default:  usage(argv[0]);
         }
     }
+    if (logpath && !g_daemon) {
+        fprintf(stderr, "-o only applies with -D (otherwise messages go to stderr)\n");
+        return 1;
+    }
+
+    /* Resolve paths now: a daemon runs in "/". Fails here, visibly, if the
+     * directory doesn't exist. */
+    char *root = absolute(dir);
+    struct stat dst;
+    if (stat(root, &dst) < 0 || !S_ISDIR(dst.st_mode)) {
+        fprintf(stderr, "%s: not a directory\n", dir);
+        return 1;
+    }
+    if (logpath) logpath = absolute_file(logpath);
+    if (g_pidfile) {
+        g_pidfile = absolute_file(g_pidfile);
+        check_pidfile(g_pidfile);
+    }
+
     signal(SIGPIPE, SIG_IGN);
     prctl(PR_SET_TIMERSLACK, 1UL);           /* precise sleeps for pacing */
 
+    /* Bind before detaching so "address in use" reaches the terminal. */
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) die("socket");
     int bufsz = 8 << 20;
@@ -554,13 +710,34 @@ int main(int argc, char **argv)
     struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port),
                              .sin_addr.s_addr = htonl(INADDR_ANY) };
     if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) die("bind");
-    fprintf(stderr, "serving %s on UDP port %d\n", dir, port);
+
+    if (g_daemon) {
+        fprintf(stderr, "serving %s on UDP port %d in the background%s%s\n", root, port,
+                logpath ? ", log " : "", logpath ? logpath : "");
+        daemonize(logpath);
+        g_quiet = 1;                         /* no per-second lines in a log */
+    }
+    if (g_pidfile) {
+        write_pidfile(g_pidfile);
+        atexit(remove_pidfile);
+    }
+
+    /* No SA_RESTART: a signal interrupts recvfrom()/ppoll() so we can exit. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    stamp();
+    fprintf(stderr, "serving %s on UDP port %d (pid %ld)\n", root, port, (long)getpid());
 
     uint8_t buf[MAX_PKT];
     struct sockaddr_in last_peer = {0};
     char last_name[256] = "";
     int64_t last_end = 0;
-    for (;;) {
+    while (!g_stop) {
         struct sockaddr_in from;
         socklen_t fl = sizeof(from);
         ssize_t r = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
@@ -573,17 +750,19 @@ int main(int argc, char **argv)
             from.sin_port == last_peer.sin_port && !strcmp(name, last_name) &&
             now_us() - last_end < 3000000)
             continue;      /* late duplicate of a request we just finished */
-        char path[4096];
-        snprintf(path, sizeof path, "%s/%s", dir, name);
+        char path[PATH_MAX + 256];
+        snprintf(path, sizeof path, "%s/%s", root, name);
         int ffd = safe_name(name) ? open(path, O_RDONLY) : -1;
         struct stat st;
         if (ffd < 0 || fstat(ffd, &st) < 0 || !S_ISREG(st.st_mode)) {
             if (ffd >= 0) close(ffd);
+            stamp();
             fprintf(stderr, "%s:%d requested '%s': not found\n",
                     inet_ntoa(from.sin_addr), ntohs(from.sin_port), name);
             send_meta(fd, &from, 1, 0, 0);
             continue;
         }
+        stamp();
         fprintf(stderr, "%s:%d requested '%s' (%lld bytes)\n",
                 inet_ntoa(from.sin_addr), ntohs(from.sin_port), name, (long long)st.st_size);
         serve(fd, &from, ffd, (uint64_t)st.st_size);
@@ -592,4 +771,10 @@ int main(int argc, char **argv)
         snprintf(last_name, sizeof last_name, "%s", name);
         last_end = now_us();
     }
+
+    stamp();
+    fprintf(stderr, "stopping (signal received)\n");
+    if (g_log) fclose(g_log);
+    free(root);
+    return 0;                                /* atexit removes the PID file */
 }
