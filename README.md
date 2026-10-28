@@ -9,11 +9,16 @@ card while the server runs on my modern 64-bit Linux workstation across my 1Gbps
 Perl directory has a 'flood.pl' script that bombards the 486 network interface with UDP datagrams
 to mimic congestion.
 
-# DEMO TIME
+# demos
 
 64-bit client, 64-bit server
 
+https://github.com/user-attachments/assets/e468135b-d391-4b79-8402-ca4295aa522f
+
+## old-school
 
 32-bit client running on 486DX33, 10 Mbps network card, 64-bit server.
 
 https://github.com/user-attachments/assets/2c98665a-dac3-4d9d-859a-622335e8ded9
+
+
