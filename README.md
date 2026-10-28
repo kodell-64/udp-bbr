@@ -17,7 +17,7 @@ https://github.com/user-attachments/assets/e468135b-d391-4b79-8402-ca4295aa522f
 
 ## old-school
 
-32-bit client running on 486DX33, 10 Mbps network card, 64-bit server.
+32-bit client running on 486DX33, 10 Mbps network card, 64-bit server. 51M files takes awhile.
 
 https://github.com/user-attachments/assets/2c98665a-dac3-4d9d-859a-622335e8ded9
 
